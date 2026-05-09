@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Types (lightweight dataclasses — no Pydantic dependency required)
+# Types (lightweight dataclasses — no Pydantic dependency required)..
 # ---------------------------------------------------------------------------
 
 class ValidationError(ValueError):
