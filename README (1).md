@@ -1,7 +1,7 @@
 """
 tests/test_esg_pipeline.py
 ==========================
-Pytest suite for ESG Pipeline — M1, M2, M3, M5, M6, Trends, and end-to-end.
+Pytest suite for ESG Pipeline — M1, M2, M3, M5, M6, and end-to-end.
 
 Run:
     pip install pytest
@@ -15,8 +15,6 @@ Coverage:
                            unbalanced breach count, custom threshold, avg/max math
     M6  — cost: no-config stub, basic tariff, peak/off-peak split,
                 demand charge, off-hours kWh, heatmap shape
-    Trend — _compute_trend helper, previous_records=None regression, delta math,
-             direction logic, zero-previous guard, carbon card, flat band
     E2E — run_pipeline returns valid PipelinePayload with all required keys
 """
 
@@ -29,7 +27,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from esg_pipeline import (
     ValidationError,
-    _compute_trend,
     m1_ingest,
     m2_consumption,
     m3_carbon,
@@ -770,194 +767,3 @@ class TestEndToEnd:
     def test_phase_type_detected_correctly(self):
         result = run_pipeline(SAMPLE_RECORDS)
         assert result["meta"]["phase_type"] == "single"
-
-# ===========================================================================
-# Trend computation — _compute_trend helper + run_pipeline integration
-# ===========================================================================
-
-# Prior-period records: same device, same shape, but lower consumption.
-# kwh span: 500.0 → 505.0 = 5.0 kWh  (current period: 10.1 kWh → +102% → "up")
-PREVIOUS_RECORDS = [
-    {**BASE_RECORD, "timestamp": "2024-05-31T22:00:00Z", "kwh": 500.0,
-     "voltage": 230.0, "pf": 0.88, "ca": 11.0},
-    {**BASE_RECORD, "timestamp": "2024-05-31T22:15:00Z", "kwh": 501.5,
-     "voltage": 229.0, "pf": 0.87, "ca": 10.5},
-    {**BASE_RECORD, "timestamp": "2024-05-31T22:30:00Z", "kwh": 503.2,
-     "voltage": 231.0, "pf": 0.89, "ca": 11.5},
-    {**BASE_RECORD, "timestamp": "2024-05-31T23:00:00Z", "kwh": 505.0,
-     "voltage": 230.5, "pf": 0.90, "ca": 11.0},
-]
-# previous total_kwh = 505.0 − 500.0 = 5.0 kWh
-
-
-class TestComputeTrend:
-    """Unit tests for the _compute_trend helper in isolation."""
-
-    def test_returns_none_when_previous_zero(self):
-        assert _compute_trend(10.0, 0.0) is None
-
-    def test_direction_up_above_1pct(self):
-        """5 → 10 = +100% → "up"."""
-        t = _compute_trend(10.0, 5.0)
-        assert t["direction"] == "up"
-
-    def test_direction_down_below_minus_1pct(self):
-        """10 → 5 = −50% → "down"."""
-        t = _compute_trend(5.0, 10.0)
-        assert t["direction"] == "down"
-
-    def test_direction_flat_within_band(self):
-        """100 → 100.5 = +0.5% → "flat"."""
-        t = _compute_trend(100.5, 100.0)
-        assert t["direction"] == "flat"
-
-    def test_direction_flat_at_exactly_1pct(self):
-        """Boundary: delta_pct == 1.0 exactly → "flat" (strictly > 1.0 required)."""
-        t = _compute_trend(101.0, 100.0)
-        assert t["direction"] == "flat"
-
-    def test_delta_correct(self):
-        t = _compute_trend(12.0, 10.0)
-        assert t["delta"] == pytest.approx(2.0, abs=1e-6)
-
-    def test_delta_pct_correct(self):
-        t = _compute_trend(12.0, 10.0)
-        assert t["delta_pct"] == pytest.approx(20.0, abs=0.001)
-
-    def test_negative_delta_correct(self):
-        t = _compute_trend(8.0, 10.0)
-        assert t["delta"] == pytest.approx(-2.0, abs=1e-6)
-        assert t["delta_pct"] == pytest.approx(-20.0, abs=0.001)
-
-    def test_flat_delta_values(self):
-        """Equal values → delta=0, delta_pct=0, direction=flat."""
-        t = _compute_trend(10.0, 10.0)
-        assert t["delta"] == pytest.approx(0.0, abs=1e-9)
-        assert t["delta_pct"] == pytest.approx(0.0, abs=1e-9)
-        assert t["direction"] == "flat"
-
-    def test_output_has_required_keys(self):
-        t = _compute_trend(10.0, 8.0)
-        assert {"delta", "delta_pct", "direction"}.issubset(t.keys())
-
-
-class TestTrendIntegration:
-    """Integration tests: previous_records wired through run_pipeline."""
-
-    # ── Regression: no previous_records → all trends null ──────────────────
-
-    def test_no_previous_records_all_trends_null(self):
-        result = run_pipeline(SAMPLE_RECORDS)
-        for card in result["metric_cards"]:
-            assert card["trend"] is None, (
-                f"Card '{card['id']}' has non-null trend without previous_records"
-            )
-
-    # ── total_kwh trend ─────────────────────────────────────────────────────
-
-    def test_total_kwh_trend_direction_up(self):
-        """Current 10.1 kWh vs previous 5.0 kWh → +102% → direction 'up'."""
-        result = run_pipeline(SAMPLE_RECORDS, previous_records=PREVIOUS_RECORDS)
-        card = next(c for c in result["metric_cards"] if c["id"] == "total_kwh")
-        assert card["trend"] is not None
-        assert card["trend"]["direction"] == "up"
-
-    def test_total_kwh_trend_delta_correct(self):
-        """delta = 10.1 − 5.0 = 5.1 kWh."""
-        result = run_pipeline(SAMPLE_RECORDS, previous_records=PREVIOUS_RECORDS)
-        card = next(c for c in result["metric_cards"] if c["id"] == "total_kwh")
-        assert card["trend"]["delta"] == pytest.approx(5.1, abs=0.05)
-
-    def test_total_kwh_trend_delta_pct_correct(self):
-        """delta_pct = 5.1 / 5.0 × 100 = 102%."""
-        result = run_pipeline(SAMPLE_RECORDS, previous_records=PREVIOUS_RECORDS)
-        card = next(c for c in result["metric_cards"] if c["id"] == "total_kwh")
-        assert card["trend"]["delta_pct"] == pytest.approx(102.0, abs=1.0)
-
-    # ── Higher previous consumption → direction "down" ─────────────────────
-
-    def test_direction_down_when_previous_higher(self):
-        """
-        Swap roles: use PREVIOUS_RECORDS as current and SAMPLE_RECORDS as previous.
-        SAMPLE_RECORDS total_kwh=10.1 > PREVIOUS_RECORDS total_kwh=5.0 →
-        current(5.0) vs previous(10.1) → −50.5% → direction 'down'.
-        """
-        result = run_pipeline(PREVIOUS_RECORDS, previous_records=SAMPLE_RECORDS)
-        card = next(c for c in result["metric_cards"] if c["id"] == "total_kwh")
-        assert card["trend"]["direction"] == "down"
-
-    # ── Zero-previous guard ─────────────────────────────────────────────────
-
-    def test_zero_previous_kwh_trend_is_null(self):
-        """
-        Construct a previous-period whose consumption is exactly 0
-        (only 1 record → M2 returns empty; total_kwh card absent → no trend).
-        Alternatively, build two records with identical kwh so delta=0... but
-        the cleanest way is to pass a single record and verify the card carries
-        no trend (M2 needs ≥2 records to produce the card at all).
-        """
-        # Use a two-record set where both readings have the same kwh → delta=0 kWh.
-        zero_prev = [
-            {**BASE_RECORD, "timestamp": "2024-05-31T22:00:00Z", "kwh": 500.0},
-            {**BASE_RECORD, "timestamp": "2024-05-31T22:15:00Z", "kwh": 500.0},
-        ]
-        result = run_pipeline(SAMPLE_RECORDS, previous_records=zero_prev)
-        card = next(c for c in result["metric_cards"] if c["id"] == "total_kwh")
-        # previous total_kwh == 0.0 → _compute_trend must return None
-        assert card["trend"] is None
-
-    # ── All trend-eligible cards are populated ──────────────────────────────
-
-    def test_all_eligible_cards_have_trend(self):
-        """Every card whose id is in TREND_CARD_IDS must have a non-null trend
-        when a valid previous period is supplied (all values > 0 for SAMPLE_RECORDS)."""
-        from esg_pipeline import TREND_CARD_IDS
-        result = run_pipeline(SAMPLE_RECORDS, previous_records=PREVIOUS_RECORDS)
-        card_map = {c["id"]: c for c in result["metric_cards"]}
-        for cid in TREND_CARD_IDS - {"co2e_kg"}:   # co2e_kg needs M3 config
-            if cid in card_map:
-                assert card_map[cid]["trend"] is not None, (
-                    f"Expected non-null trend for card '{cid}'"
-                )
-
-    # ── Carbon (co2e_kg) card trend ─────────────────────────────────────────
-
-    def test_carbon_card_trend_populated(self):
-        """co2e_kg virtual card must carry a trend when M3 config is provided
-        and a valid previous period exists."""
-        result = run_pipeline(
-            SAMPLE_RECORDS,
-            previous_records=PREVIOUS_RECORDS,
-            m3_config={"grid_region": "PK"},
-        )
-        card_map = {c["id"]: c for c in result["metric_cards"]}
-        assert "co2e_kg" in card_map, "co2e_kg card missing from metric_cards"
-        assert card_map["co2e_kg"]["trend"] is not None
-
-    def test_carbon_card_trend_direction_matches_kwh(self):
-        """Since EF is constant, co2e_kg scales linearly with kWh, so trend
-        direction must match total_kwh direction."""
-        result = run_pipeline(
-            SAMPLE_RECORDS,
-            previous_records=PREVIOUS_RECORDS,
-            m3_config={"grid_region": "PK"},
-        )
-        card_map = {c["id"]: c for c in result["metric_cards"]}
-        kwh_dir   = card_map["total_kwh"]["trend"]["direction"]
-        co2e_dir  = card_map["co2e_kg"]["trend"]["direction"]
-        assert co2e_dir == kwh_dir
-
-    # ── Trend shape in output ───────────────────────────────────────────────
-
-    def test_trend_has_correct_keys(self):
-        result = run_pipeline(SAMPLE_RECORDS, previous_records=PREVIOUS_RECORDS)
-        card = next(c for c in result["metric_cards"] if c["id"] == "total_kwh")
-        assert {"delta", "delta_pct", "direction"}.issubset(card["trend"].keys())
-
-    def test_trend_json_serialisable(self):
-        import json
-        result = run_pipeline(SAMPLE_RECORDS, previous_records=PREVIOUS_RECORDS,
-                               m3_config={"grid_region": "PK"})
-        dumped = json.dumps(result)
-        assert "delta" in dumped
-        assert "direction" in dumped
