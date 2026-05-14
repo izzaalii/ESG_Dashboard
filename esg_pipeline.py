@@ -770,12 +770,75 @@ def m7_report(_payload: dict, _config: dict | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Trend computation — period-over-period delta helper
+# ---------------------------------------------------------------------------
+
+#: Cards eligible for trend computation, in pipeline id → label order.
+TREND_CARD_IDS = {"total_kwh", "peak_kw", "avg_pf", "avg_kva", "voltage_avg", "co2e_kg"}
+
+
+def _compute_trend(current_value: float, previous_value: float) -> dict | None:
+    """
+    Compute a MetricCard.trend object from two scalar values.
+
+    Rules
+    -----
+    - If previous_value == 0 → cannot compute a meaningful percentage; return None.
+    - direction "up"   if delta_pct >  1.0 %
+    - direction "down" if delta_pct < -1.0 %
+    - direction "flat" otherwise
+
+    Returns
+    -------
+    { delta: float, delta_pct: float, direction: str } or None
+    """
+    if previous_value == 0:
+        return None
+
+    delta     = round(current_value - previous_value, 6)
+    delta_pct = round(delta / previous_value * 100, 4)
+
+    if delta_pct > 1.0:
+        direction = "up"
+    elif delta_pct < -1.0:
+        direction = "down"
+    else:
+        direction = "flat"
+
+    return {"delta": delta, "delta_pct": delta_pct, "direction": direction}
+
+
+def _apply_trends(
+    cards: list[dict],
+    prev_card_map: dict[str, float],
+) -> list[dict]:
+    """
+    Return a new list of metric cards with trend fields populated where possible.
+
+    Parameters
+    ----------
+    cards         : current period metric cards (will not be mutated)
+    prev_card_map : {card_id: value} from the previous period
+    """
+    result = []
+    for card in cards:
+        cid = card["id"]
+        if cid in TREND_CARD_IDS and cid in prev_card_map:
+            trend = _compute_trend(card["value"], prev_card_map[cid])
+            result.append({**card, "trend": trend})
+        else:
+            result.append(card)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # run_pipeline — Public entry point
 # ---------------------------------------------------------------------------
 
 def run_pipeline(
     records: list[dict],
     *,
+    previous_records: list[dict] | None = None,
     m3_config: dict | None = None,
     m5_config: dict | None = None,
     m6_config: dict | None = None,
@@ -785,13 +848,19 @@ def run_pipeline(
 
     Parameters
     ----------
-    records     : list of raw device record dicts (DeviceRecord schema)
-    m3_config   : optional carbon module config
-                  Keys: emission_factor (float, kgCO₂e/kWh), grid_region (str, e.g. "PK"),
-                        ef_source (str), ef_verified (bool)
-    m5_config   : optional anomaly detection config
-                  Keys: imbalance_threshold_pct (float, default 2.0)
-    m6_config   : optional cost/tariff config
+    records          : list of raw device record dicts (DeviceRecord schema)
+    previous_records : optional same-schema records from the prior period.
+                       When provided, M1→M2→M4 (and M3 if m3_config is set) are
+                       run on this set and the resulting metric-card values are
+                       used to populate ``trend`` on every matching current card.
+                       Cards whose previous value is zero, or cards with no prior
+                       counterpart, keep ``trend: null``.
+    m3_config        : optional carbon module config
+                       Keys: emission_factor (float, kgCO₂e/kWh), grid_region (str, e.g. "PK"),
+                             ef_source (str), ef_verified (bool)
+    m5_config        : optional anomaly detection config
+                       Keys: imbalance_threshold_pct (float, default 2.0)
+    m6_config        : optional cost/tariff config
 
     Returns
     -------
@@ -818,10 +887,40 @@ def run_pipeline(
     cost_result = m6_cost(m2_out, m6_config)
     _         = m7_report({}, None)       # No-op for now
 
+    # --- Build previous-period card map (for trend computation) ---
+    prev_card_map: dict[str, float] = {}
+    if previous_records is not None:
+        prev_clean  = m1_ingest(previous_records)
+        prev_m2_out = m2_consumption(prev_clean)
+        prev_m4_out = m4_power_quality(prev_clean)
+        prev_carbon = m3_carbon(prev_m2_out, m3_config)
+
+        # Collect all previous card values indexed by id
+        for card in prev_m2_out["metric_cards"] + prev_m4_out["metric_cards"]:
+            prev_card_map[card["id"]] = card["value"]
+
+        # Add carbon card (co2e_kg) if M3 produced a result for both periods
+        if prev_carbon.get("co2e_kg") is not None:
+            prev_card_map["co2e_kg"] = prev_carbon["co2e_kg"]
+
     # --- Assemble payload ---
     # Merge M6 metric cards (cost_total, demand_charge) into top-level cards if M6 ran
-    m6_cards   = cost_result["metric_cards"] if cost_result else []
-    all_cards  = m2_out["metric_cards"] + m4_out["metric_cards"] + m6_cards
+    m6_cards  = cost_result["metric_cards"] if cost_result else []
+    raw_cards = m2_out["metric_cards"] + m4_out["metric_cards"] + m6_cards
+
+    # Attach co2e_kg as a virtual card so _apply_trends can match it
+    if carbon.get("co2e_kg") is not None:
+        raw_cards = raw_cards + [{
+            "id":        "co2e_kg",
+            "label":     "Total Carbon Emissions",
+            "value":     carbon["co2e_kg"],
+            "unit":      "kgCO₂e",
+            "precision": 2,
+            "trend":     None,
+        }]
+
+    # Apply trends (no-op when prev_card_map is empty)
+    all_cards  = _apply_trends(raw_cards, prev_card_map) if prev_card_map else raw_cards
     all_series = m2_out["chart_series"] + m4_out["chart_series"]
 
     payload: dict[str, Any] = {
@@ -848,6 +947,526 @@ def run_pipeline(
 # ---------------------------------------------------------------------------
 # Quick smoke-test (run: python esg_pipeline.py)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Multi-Device Site Aggregation Layer
+# ---------------------------------------------------------------------------
+#
+# Design goals
+# ─────────────
+# 1. Accept a *mixed* list of raw records from any number of devices.
+# 2. Classify each record as a Power Meter (PM) or Temperature Monitor (TM)
+#    by field signature — no new required schema fields.
+# 3. Aggregate PM records across devices into one synthetic per-bucket record
+#    that M1→M6 can process unchanged.
+# 4. Aggregate TM records into a parallel environmental series.
+# 5. Expose a single new public entry point: run_site_pipeline().
+#    The existing run_pipeline() is NOT modified.
+#
+# Device classification heuristic
+# ────────────────────────────────
+# PM  — has "kwh" field (energy meter, required by M1)
+# TM  — has at least one of: "temperature", "humidity", "conductivity"
+#        and does NOT have "kwh"
+# Mixed records (both kwh + temperature) are treated as PM; TM fields are
+# forwarded to the environmental aggregation pass.
+
+# TM field names we recognise
+_TM_FIELDS = ("temperature", "humidity", "conductivity")
+
+
+def _classify_record(record: dict) -> str:
+    """Return "pm" or "tm" based on field signature."""
+    if "kwh" in record:
+        return "pm"
+    if any(record.get(f) is not None for f in _TM_FIELDS):
+        return "tm"
+    return "pm"  # default — will be validated by M1
+
+
+def _floor_15min(dt: datetime) -> datetime:
+    """Floor a datetime to the nearest 15-minute boundary."""
+    return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
+
+
+# ---------------------------------------------------------------------------
+# PM aggregation
+# ---------------------------------------------------------------------------
+
+def _aggregate_pm_records(pm_records: list[dict], site_id: str, site_name: str) -> list[dict]:
+    """
+    Merge per-device PM records into one synthetic per-bucket record.
+
+    Aggregation rules per 15-min bucket:
+    - kwh       : sum across all devices (site total consumption)
+    - voltage   : average across devices
+    - pf        : average across devices (only where present)
+    - kva       : sum across devices (only where present)
+    - kw        : sum across devices (only where present)
+    - ca/cb/cc  : sum across devices that are 3-phase (site-level phase load)
+    - voltage_a/b/c : average across 3-phase devices
+
+    The synthetic record carries:
+    - device_id   = site_id
+    - device_name = site_name
+    - interval_s  = 900  (15-min fixed after bucketing)
+    - timestamp   = bucket start ISO string
+    """
+    if not pm_records:
+        return []
+
+    # Parse timestamps once; floor each to 15-min bucket
+    parsed: list[tuple[datetime, dict]] = []
+    for r in pm_records:
+        try:
+            ts = _parse_ts(r["timestamp"])
+        except ValidationError:
+            continue
+        parsed.append((_floor_15min(ts), r))
+
+    if not parsed:
+        return []
+
+    # Group by (bucket_ts, device_id) — take last reading per device per bucket
+    # to avoid double-counting cumulative meters within the same slot.
+    DeviceBucket = tuple  # (bucket_dt, device_id)
+    per_device: dict[DeviceBucket, dict] = {}
+    for bucket_ts, r in parsed:
+        key = (bucket_ts, r.get("device_id", "unknown"))
+        per_device[key] = r  # last record wins within bucket
+
+    # Now bucket by timestamp only → list of device records per slot
+    by_bucket: dict[datetime, list[dict]] = {}
+    for (bucket_ts, _dev_id), r in per_device.items():
+        by_bucket.setdefault(bucket_ts, []).append(r)
+
+    # --- Compute per-device kWh deltas across sorted buckets ---------------
+    # Each device's raw kwh is a cumulative meter reading.  We need the
+    # per-bucket delta (kWh consumed in that slot) so we can sum across
+    # devices correctly without double-counting the absolute meter offset.
+    sorted_buckets = sorted(by_bucket.keys())
+    device_prev_kwh: dict[str, float] = {}  # last seen kwh per device
+
+    # First pass: annotate each record in each bucket with its delta
+    bucket_deltas: dict[datetime, dict[str, float]] = {}   # bucket → {dev_id: delta_kwh}
+    for bucket_ts in sorted_buckets:
+        bucket_deltas[bucket_ts] = {}
+        for r in by_bucket[bucket_ts]:
+            dev_id = r.get("device_id", "unknown")
+            raw_kwh = r.get("kwh", 0.0)
+            prev = device_prev_kwh.get(dev_id)
+            if prev is None:
+                # First reading for this device — delta is 0 (no prior bucket)
+                delta = 0.0
+            else:
+                delta = max(raw_kwh - prev, 0.0)   # guard against rollover
+            device_prev_kwh[dev_id] = raw_kwh
+            bucket_deltas[bucket_ts][dev_id] = delta
+
+    # Build one synthetic record per bucket
+    synthetic: list[dict] = []
+    cumulative_kwh = 0.0
+
+    for bucket_ts in sorted_buckets:
+        recs = by_bucket[bucket_ts]
+        deltas = bucket_deltas[bucket_ts]
+
+        # Sum kWh deltas across all devices for this bucket
+        kwh_delta_sum = round(sum(deltas.values()), 4)
+        cumulative_kwh = round(cumulative_kwh + kwh_delta_sum, 4)
+
+        # --- Averaged / summed fields ---
+        def _mean_field(field: str) -> float | None:
+            vals = [r[field] for r in recs if r.get(field) is not None]
+            return round(sum(vals) / len(vals), 6) if vals else None
+
+        def _sum_field(field: str) -> float | None:
+            vals = [r[field] for r in recs if r.get(field) is not None]
+            return round(sum(vals), 6) if vals else None
+
+        voltage = _mean_field("voltage")
+        pf      = _mean_field("pf")
+        kva     = _sum_field("kva")
+        kw      = _sum_field("kw")
+
+        # Phase currents — only sum across devices that have all three
+        phase_recs = [r for r in recs if all(r.get(k) is not None for k in ("ca", "cb", "cc"))]
+        ca = round(sum(r["ca"] for r in phase_recs), 6) if phase_recs else None
+        cb = round(sum(r["cb"] for r in phase_recs), 6) if phase_recs else None
+        cc = round(sum(r["cc"] for r in phase_recs), 6) if phase_recs else None
+
+        # Per-phase voltages
+        va = _mean_field("voltage_a")
+        vb = _mean_field("voltage_b")
+        vc = _mean_field("voltage_c")
+
+        rec: dict = {
+            "device_id":   site_id,
+            "device_name": site_name,
+            "timestamp":   _iso(bucket_ts),
+            "interval_s":  900,
+            "kwh":         cumulative_kwh,   # monotonically increasing — M1-compatible
+            "voltage":     voltage if voltage is not None else 230.0,
+        }
+        if pf  is not None: rec["pf"]  = pf
+        if kva is not None: rec["kva"] = kva
+        if kw  is not None: rec["kw"]  = kw
+        if ca  is not None:
+            rec["ca"] = ca
+            rec["cb"] = cb
+            rec["cc"] = cc
+        if va is not None:
+            rec["voltage_a"] = va
+            rec["voltage_b"] = vb
+            rec["voltage_c"] = vc
+
+        synthetic.append(rec)
+
+    return synthetic
+
+
+# ---------------------------------------------------------------------------
+# TM aggregation
+# ---------------------------------------------------------------------------
+
+def _aggregate_tm_records(tm_records: list[dict]) -> dict:
+    """
+    Aggregate temperature monitor records into an environmental result dict.
+
+    Returns
+    -------
+    {
+        "temperature_avg":   float | None,   # °C average over window
+        "temperature_min":   float | None,
+        "temperature_max":   float | None,
+        "humidity_avg":      float | None,   # % RH average
+        "conductivity_avg":  float | None,   # µS/cm average
+        "series": {
+            "temperature":  [{"timestamp": str, "value": float}],
+            "humidity":     [{"timestamp": str, "value": float}],
+            "conductivity": [{"timestamp": str, "value": float}],
+        },
+        "device_count": int,
+        "record_count":  int,
+    }
+    or None when no TM records are present.
+    """
+    if not tm_records:
+        return None
+
+    temp_pts:  list[dict] = []
+    hum_pts:   list[dict] = []
+    cond_pts:  list[dict] = []
+    device_ids: set[str]  = set()
+
+    for r in tm_records:
+        try:
+            ts = _parse_ts(r["timestamp"])
+        except ValidationError:
+            continue
+
+        ts_str = _iso(ts)
+        device_ids.add(r.get("device_id", "unknown"))
+
+        if r.get("temperature") is not None:
+            temp_pts.append({"timestamp": ts_str, "value": round(float(r["temperature"]), 3)})
+        if r.get("humidity") is not None:
+            hum_pts.append({"timestamp": ts_str, "value": round(float(r["humidity"]), 3)})
+        if r.get("conductivity") is not None:
+            cond_pts.append({"timestamp": ts_str, "value": round(float(r["conductivity"]), 3)})
+
+    def _stats(pts: list[dict]) -> tuple:
+        vals = [p["value"] for p in pts]
+        if not vals:
+            return None, None, None
+        return (
+            round(sum(vals) / len(vals), 3),
+            round(min(vals), 3),
+            round(max(vals), 3),
+        )
+
+    t_avg, t_min, t_max = _stats(temp_pts)
+    h_avg, _, _         = _stats(hum_pts)
+    c_avg, _, _         = _stats(cond_pts)
+
+    return {
+        "temperature_avg":  t_avg,
+        "temperature_min":  t_min,
+        "temperature_max":  t_max,
+        "humidity_avg":     h_avg,
+        "conductivity_avg": c_avg,
+        "series": {
+            "temperature":  sorted(temp_pts,  key=lambda p: p["timestamp"]),
+            "humidity":     sorted(hum_pts,   key=lambda p: p["timestamp"]),
+            "conductivity": sorted(cond_pts,  key=lambda p: p["timestamp"]),
+        },
+        "device_count": len(device_ids),
+        "record_count":  len(tm_records),
+    }
+
+
+# ---------------------------------------------------------------------------
+# run_site_pipeline — Public entry point for multi-device / site-level runs
+# ---------------------------------------------------------------------------
+
+def _build_device_inventory(
+    pm_records: list[dict],
+    tm_records: list[dict],
+    window_from: str,
+    window_to:   str,
+) -> list[dict]:
+    """
+    Build a per-device summary for the dashboard device roster.
+
+    Each entry describes one physical device that contributed records in this
+    window.  The dashboard can use this to render a device list, flag gaps,
+    or show per-device sparklines.
+
+    Returns
+    -------
+    List of dicts, one per unique device_id, sorted by device_id:
+    {
+        device_id   : str,
+        device_name : str,
+        device_type : "pm" | "tm",
+        zone        : str | None,      # from record["zone"] if present
+        record_count: int,
+        kwh_total   : float | None,    # PM only — sum of deltas over window
+        last_seen   : str,             # ISO timestamp of most recent record
+        online      : bool,            # True if last record is within 2× interval_s of window_to
+    }
+    """
+    from collections import defaultdict
+
+    # Combine all records with their type tag
+    tagged: list[tuple[str, dict]] = (
+        [("pm", r) for r in pm_records] +
+        [("tm", r) for r in tm_records]
+    )
+
+    # Group by device_id
+    by_device: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for dtype, r in tagged:
+        did = r.get("device_id", "unknown")
+        by_device[did].append((dtype, r))
+
+    window_to_dt = _parse_ts(window_to)
+    inventory: list[dict] = []
+
+    for dev_id in sorted(by_device):
+        entries = by_device[dev_id]
+        dtype   = entries[0][0]  # type is consistent per device
+        records = [r for _, r in entries]
+
+        # Most recent record
+        ts_list = []
+        for r in records:
+            try:
+                ts_list.append(_parse_ts(r["timestamp"]))
+            except ValidationError:
+                pass
+        last_ts = max(ts_list) if ts_list else None
+
+        # Online heuristic: last record within 2× the device's reporting interval
+        interval_s = records[0].get("interval_s", 900)
+        online = False
+        if last_ts is not None:
+            gap_s = (window_to_dt - last_ts).total_seconds()
+            online = gap_s <= interval_s * 2
+
+        # kWh total for PMs (sum of deltas — mirrors aggregation logic)
+        kwh_total: float | None = None
+        if dtype == "pm":
+            sorted_recs = sorted(records, key=lambda r: r.get("timestamp", ""))
+            kwh_total = 0.0
+            prev_kwh: float | None = None
+            for r in sorted_recs:
+                raw = r.get("kwh")
+                if raw is None:
+                    continue
+                if prev_kwh is not None and raw > prev_kwh:
+                    kwh_total += raw - prev_kwh
+                prev_kwh = raw
+            kwh_total = round(kwh_total, 4)
+
+        inventory.append({
+            "device_id":    dev_id,
+            "device_name":  records[0].get("device_name", dev_id),
+            "device_type":  dtype,
+            "zone":         records[0].get("zone", None),
+            "record_count": len(records),
+            "kwh_total":    kwh_total,
+            "last_seen":    _iso(last_ts) if last_ts else None,
+            "online":       online,
+        })
+
+    return inventory
+
+
+def _aggregate_pm_by_zone(
+    pm_records: list[dict],
+    site_id:    str,
+) -> list[dict]:
+    """
+    Compute per-zone kWh totals for the zone_breakdown block.
+
+    Records carry an optional "zone" field (string, e.g. "Floor 1", "HVAC").
+    Records without a zone field are grouped under "_unassigned".
+
+    Returns
+    -------
+    List of { zone, kwh_total, device_count, device_ids } sorted by zone name.
+    """
+    from collections import defaultdict
+
+    # Per-zone, per-device: collect sorted kwh readings to compute deltas
+    zone_device_readings: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+
+    for r in pm_records:
+        zone   = r.get("zone") or "_unassigned"
+        dev_id = r.get("device_id", "unknown")
+        kwh    = r.get("kwh")
+        if kwh is not None:
+            zone_device_readings[zone][dev_id].append(kwh)
+
+    result: list[dict] = []
+    for zone in sorted(zone_device_readings):
+        zone_kwh   = 0.0
+        device_ids = set()
+        for dev_id, readings in zone_device_readings[zone].items():
+            readings_sorted = sorted(readings)
+            if len(readings_sorted) >= 2:
+                # Sum of deltas = last − first (handles monotonic cumulative meter)
+                zone_kwh += max(readings_sorted[-1] - readings_sorted[0], 0.0)
+            device_ids.add(dev_id)
+        result.append({
+            "zone":         zone,
+            "kwh_total":    round(zone_kwh, 4),
+            "device_count": len(device_ids),
+            "device_ids":   sorted(device_ids),
+        })
+
+    return result
+
+
+def run_site_pipeline(
+    records: list[dict],
+    *,
+    site_id:          str               = "SITE-001",
+    site_name:        str               = "Site",
+    previous_records: list[dict] | None = None,
+    m3_config:        dict | None       = None,
+    m5_config:        dict | None       = None,
+    m6_config:        dict | None       = None,
+) -> dict:
+    """
+    Site / building-level ESG pipeline for mixed multi-device input.
+
+    Designed to handle any number of devices across floors, zones, or
+    subsystems in a single building — collapsing them into one unified
+    dashboard payload while preserving per-device and per-zone breakdowns.
+
+    Accepts records from any mix of:
+    - Power Meter (PM) devices  — identified by presence of "kwh" field
+    - Temperature Monitor (TM) devices — identified by "temperature" /
+      "humidity" / "conductivity" fields
+
+    Optional per-record field
+    -------------------------
+    "zone" : str  — logical grouping (e.g. "Floor 1", "HVAC", "Server Room").
+                    When present, a zone_breakdown block is added to the payload.
+                    Records without a zone are grouped under "_unassigned".
+
+    Steps
+    -----
+    1. Classify each record as PM or TM.
+    2. Aggregate PM records across all devices → one synthetic site-level stream.
+    3. Aggregate TM records → environmental summary.
+    4. Build device_inventory (per-device roster with online/offline status).
+    5. Build zone_breakdown (per-zone kWh totals, if any zone fields present).
+    6. Run existing run_pipeline() on aggregated PM stream (M1→M6 unchanged).
+    7. Attach building-level blocks to payload.
+
+    Parameters
+    ----------
+    records          : mixed list of raw device records (unlimited devices)
+    site_id          : written into meta.device_id and meta.site_id
+    site_name        : written into meta.device_name and meta.site_name
+    previous_records : optional prior-period mixed records for trend deltas
+    m3_config        : carbon module config (passed through)
+    m5_config        : phase imbalance config (passed through)
+    m6_config        : cost/tariff config (passed through)
+
+    Returns
+    -------
+    PipelinePayload dict — same contract as run_pipeline(), plus:
+
+        "environmental"  : EnvironmentalResult | None
+        "device_inventory": list[DeviceInventoryEntry]
+        "zone_breakdown" : list[ZoneBreakdown] | None   (None if no zone fields)
+    """
+    if not records:
+        raise ValidationError("Empty record list")
+
+    # --- Step 1: Classify ---
+    pm_records: list[dict] = []
+    tm_records: list[dict] = []
+    for r in records:
+        if _classify_record(r) == "tm":
+            tm_records.append(r)
+        else:
+            pm_records.append(r)
+
+    # --- Step 2: Aggregate PMs into one site-level stream ---
+    aggregated_pm = _aggregate_pm_records(pm_records, site_id, site_name)
+
+    if not aggregated_pm:
+        raise ValidationError(
+            "No Power Meter records found in input after aggregation. "
+            "Ensure at least one record contains a 'kwh' field."
+        )
+
+    # --- Step 3: Aggregate TMs ---
+    environmental = _aggregate_tm_records(tm_records)
+
+    # --- Step 4: Aggregate previous period (for trends) ---
+    aggregated_prev: list[dict] | None = None
+    if previous_records is not None:
+        prev_pm = [r for r in previous_records if _classify_record(r) == "pm"]
+        aggregated_prev = _aggregate_pm_records(prev_pm, site_id, site_name) or None
+
+    # --- Step 5: Run core pipeline on aggregated PM stream ---
+    payload = run_pipeline(
+        aggregated_pm,
+        previous_records=aggregated_prev,
+        m3_config=m3_config,
+        m5_config=m5_config,
+        m6_config=m6_config,
+    )
+
+    # --- Step 6: Build building-level blocks ---
+    window_from = payload["meta"]["window"]["from"]
+    window_to   = payload["meta"]["window"]["to"]
+
+    device_inventory = _build_device_inventory(
+        pm_records, tm_records, window_from, window_to
+    )
+
+    # Zone breakdown — only include if at least one record has a "zone" field
+    has_zones = any(r.get("zone") for r in pm_records)
+    zone_breakdown = _aggregate_pm_by_zone(pm_records, site_id) if has_zones else None
+
+    # --- Step 7: Attach all blocks and enrich meta ---
+    payload["environmental"]   = environmental
+    payload["device_inventory"] = device_inventory
+    payload["zone_breakdown"]  = zone_breakdown
+    payload["meta"]["site_id"]      = site_id
+    payload["meta"]["site_name"]    = site_name
+    payload["meta"]["device_count"] = len({r.get("device_id") for r in pm_records})
+    payload["meta"]["tm_count"]     = len({r.get("device_id") for r in tm_records})
+
+    return payload
+
 
 if __name__ == "__main__":
     import json

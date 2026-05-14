@@ -767,3 +767,191 @@ class TestEndToEnd:
     def test_phase_type_detected_correctly(self):
         result = run_pipeline(SAMPLE_RECORDS)
         assert result["meta"]["phase_type"] == "single"
+# ESG Pipeline
+
+Python analytics pipeline that converts raw smart-meter records into ESG
+dashboard payloads — consumption, power quality, carbon emissions, cost
+analysis, and anomaly detection.
+
+---
+
+## Pipeline modules
+
+| Module | Status | Description |
+|--------|--------|-------------|
+| M1 | ✅ | Ingestion & validation |
+| M2 | ✅ | Consumption — kWh deltas and rollups |
+| M4 | ✅ | Power quality — kVA, PF, voltage |
+| M3 | ✅ | Carbon emissions (config-gated) |
+| M5 | ✅ | Phase current imbalance — 3-phase only |
+| M6 | ✅ | Cost & demand analysis (config-gated) |
+| M7 | 🔲 | Report generation (stub) |
+
+---
+
+## Quick start
+
+```python
+from esg_pipeline import run_pipeline
+
+records = [...]          # list[dict] — see DeviceRecord schema below
+payload = run_pipeline(records)
+# Returns a JSON-serialisable PipelinePayload dict
+```
+
+### With optional modules
+
+```python
+payload = run_pipeline(
+    records,
+    previous_records = prev_records,          # prior period for trend deltas
+    m3_config = {"grid_region": "PK"},        # carbon emissions
+    m5_config = {"imbalance_threshold_pct": 2.0},
+    m6_config = {
+        "tariff_per_kwh":       45.0,
+        "peak_tariff_per_kwh":  60.0,
+        "peak_hours":           [17, 18, 19, 20, 21],
+        "demand_charge_per_kw": 500.0,
+        "operational_schedule": {
+            "start_hour": 8, "end_hour": 18,
+            "days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+        },
+    },
+)
+```
+
+---
+
+## DeviceRecord schema
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `device_id` | str | ✅ | |
+| `device_name` | str | ✅ | |
+| `timestamp` | str | ✅ | ISO-8601, UTC |
+| `interval_s` | int | ✅ | Measurement interval in seconds |
+| `kwh` | float | ✅ | Cumulative meter reading (≥ 0) |
+| `voltage` | float | ✅ | Line voltage (V) |
+| `pf` | float | | Power factor in (0, 1] |
+| `kw` | float | | Active power (kW) |
+| `kva` | float | | Apparent power; computed if absent |
+| `ca` | float | | Phase A current (A) |
+| `cb` | float | | Phase B current — 3-phase only |
+| `cc` | float | | Phase C current — 3-phase only |
+| `voltage_a/b/c` | float | | Per-phase voltages — 3-phase only |
+
+Phase type is auto-detected: presence of `ca`, `cb`, `cc` (or `voltage_a/b/c`)
+triggers 3-phase mode and applies the corresponding voltage bounds (340–460 V
+line-to-line). Single-phase bounds are 180–260 V.
+
+---
+
+## Period-over-period trends
+
+Pass `previous_records` to `run_pipeline()` to populate the `trend` field on
+every metric card:
+
+```python
+payload = run_pipeline(current_records, previous_records=prior_records)
+```
+
+### MetricCard.trend schema
+
+```
+trend?: {
+  delta:     number    # absolute change vs previous period
+  delta_pct: number    # percentage change
+  direction: "up" | "down" | "flat"
+}
+```
+
+**Direction thresholds** — `"up"` when `delta_pct > 1 %`, `"down"` when
+`delta_pct < -1 %`, `"flat"` otherwise. This 1 % dead-band avoids noise-driven
+direction flips on stable signals.
+
+**Zero-previous guard** — when the previous period's value is exactly zero,
+`trend` is set to `null` (division by zero would produce a meaningless
+percentage).
+
+**Cards with trend support:** `total_kwh`, `peak_kw`, `avg_pf`, `avg_kva`,
+`voltage_avg`, `co2e_kg` (only when M3 ran on both periods).
+
+When `previous_records` is omitted, every card keeps `"trend": null` — no
+regression in existing callers.
+
+---
+
+## Output: PipelinePayload
+
+```json
+{
+  "meta": {
+    "device_id":   "DEV-001",
+    "device_name": "Main Panel",
+    "phase_type":  "single",
+    "computed_at": "2024-06-01T12:00:00Z",
+    "window": { "from": "...", "to": "..." }
+  },
+  "metric_cards": [
+    {
+      "id":        "total_kwh",
+      "label":     "Total Consumption",
+      "value":     10.1,
+      "unit":      "kWh",
+      "precision": 2,
+      "trend": {
+        "delta":     5.1,
+        "delta_pct": 102.0,
+        "direction": "up"
+      }
+    }
+  ],
+  "chart_series": [...],
+  "carbon":    { "co2e_kg": 4.06, "data_quality": "estimated", ... },
+  "anomalies": null,
+  "cost":      null
+}
+```
+
+---
+
+## M3 — Carbon config
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `emission_factor` | float | kgCO₂e per kWh (highest priority) |
+| `grid_region` | str | ISO country code — looks up built-in IEA 2023 average |
+| `ef_source` | str | Audit-trail label |
+| `ef_verified` | bool | `true` → `data_quality: "verified"` |
+
+Built-in regions: `PK` (0.402), `IN` (0.716), `US` (0.386), `UK` (0.233),
+`DE` (0.364), `AU` (0.590), `AE` (0.450), `SG` (0.408).
+
+---
+
+## M6 — Cost config
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `tariff_per_kwh` | float | Base rate (PKR/kWh) — **required** |
+| `peak_tariff_per_kwh` | float | Peak-hour rate |
+| `peak_hours` | list[int] | Hours 0-23 billed at peak rate |
+| `demand_charge_per_kw` | float | Monthly demand charge per kW |
+| `operational_schedule` | dict | `{start_hour, end_hour, days}` for off-hours kWh |
+
+---
+
+## Running tests
+
+Run:
+```
+    pip install pytest
+    pytest tests/test_esg_pipeline.py -v
+```
+
+The suite covers 111 tests across M1, M2, M3, M5, M6, trend computation, and
+end-to-end scenarios.
+
+
+
+
