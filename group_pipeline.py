@@ -541,3 +541,75 @@ if __name__ == "__main__":
         cache=cache,
     )
     print(" done.")
+    # =========================================================================
+    # MultiWindowCache demo — NEW (added alongside multi_window_cache.py)
+    # =========================================================================
+    # Shows how to use the slab-based cache for dashboard window-switching.
+    # Uses the same _DEVICE_RECORDS / _fetch fixture defined above.
+    # =========================================================================
+
+    print(f"\n{'='*60}")
+    print("MultiWindowCache demo (single device, multiple windows)")
+    print(f"{'='*60}")
+
+    from datetime import date
+    from multi_window_cache import MultiWindowCache, WindowPreComputer, window_preset
+
+    # fetch_fn adapter: multi_window_cache passes (device_id, from_str, to_str)
+    # which is the same signature as _fetch — no changes needed.
+    def _fetch_windowed(device_id: str, w_from: str, w_to: str) -> list[dict]:
+        return _fetch(device_id, w_from, w_to)
+
+    mwc    = MultiWindowCache()
+    worker = WindowPreComputer(
+        slab_cache = mwc.slab_cache,
+        fetch_fn   = _fetch_windowed,
+        device_ids = ["DEV-A", "DEV-B", "DEV-C"],
+        max_workers = 4,
+    )
+
+    # --- Step 1: back-fill slabs (first deploy / cold cache) ---
+    # In production this runs once at startup.
+    # Here we use days=1 because our fixture only has data for one day.
+    print("\nBack-filling 1 day of slabs for all devices...")
+    counts = worker.backfill(
+        days      = 1,
+        m3_config = {"grid_region": "PK"},
+        m6_config = {"tariff_per_kwh": 45.0},
+    )
+    print(f"  Slabs written: {counts}")
+    print(f"  Cache stats  : {mwc.stats()}")
+
+    # --- Step 2: dashboard request — any preset, instant from cache ---
+    for preset in ("1d",):          # add "7d", "30d" when you have real data
+        # window_preset() returns today's date range; we override to our fixture date
+        from_d = date(2024, 6, 1)
+        to_d   = date(2024, 6, 1)
+        print(f"\nget_window DEV-A [{from_d} → {to_d}] (preset ~'{preset}'):")
+        pl = mwc.get_window(
+            device_id = "DEV-A",
+            from_date = from_d,
+            to_date   = to_d,
+            fetch_fn  = _fetch_windowed,
+            m3_config = {"grid_region": "PK"},
+            m6_config = {"tariff_per_kwh": 45.0},
+        )
+        cards = {c["id"]: c for c in pl["metric_cards"]}
+        for cid in ("total_kwh", "peak_kw", "cost_total"):
+            if cid in cards:
+                c = cards[cid]
+                print(f"  {cid:20s}: {c['value']:.3f} {c['unit']}")
+        if pl.get("carbon") and pl["carbon"].get("co2e_kg") is not None:
+            print(f"  {'co2e_kg':20s}: {pl['carbon']['co2e_kg']:.4f} kgCO₂e")
+        print(f"  slab_count        : {pl['meta'].get('slab_count', 1)}")
+
+    # --- Step 3: simulate scheduler tick (refresh today's partial slab) ---
+    print("\nSimulating 15-min scheduler tick (refresh_today)...")
+    tick_results = worker.refresh_today(
+        m3_config = {"grid_region": "PK"},
+        m6_config = {"tariff_per_kwh": 45.0},
+    )
+    print(f"  Tick results: {tick_results}")
+    print(f"  Cache stats : {mwc.stats()}")
+
+    print("\nDone. Run 'python multi_window_cache.py' for a full 7-day latency demo.")
